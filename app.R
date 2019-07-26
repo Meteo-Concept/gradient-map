@@ -3,6 +3,7 @@ library(rgdal)
 library(rgeos)
 library(raster)
 library(RColorBrewer)
+library(sysfonts)
 library(shiny)
 
 breaks <- list(
@@ -59,7 +60,8 @@ ui <- fluidPage(
 			      ),
 			      mainPanel(
 					fluidRow(
-						 column(12, plotOutput(outputId="map", height="auto")) #, height="600px"
+						 column(12, plotOutput(outputId="map", height="auto")), #, height="600px"
+						 column(12, plotOutput(outputId="mapvalues", height="auto")) #, height="600px"
 						)
 			      )
 		)
@@ -75,7 +77,7 @@ server <- function(input, output, session) {
 	output$map <- renderPlot({
 		values <- communesInput()
 		if (length(values) > 0) {
-			pred <- idw(TEMP~1, locations=communesInput(), newdata=grd)
+			pred <- idw(TEMP~1, locations=values, newdata=grd)
 			par(bg=NA, bty="n", xpd=NA, xaxs='i', xaxt='n', yaxs='i', yaxt='n', plt=c(0,1,0,1), oma=c(0,0,0,0))
 			r <- mask(raster(pred), contour, updatevalue=NA)
 			plot(extent(mapCorners),col="transparent")
@@ -83,6 +85,18 @@ server <- function(input, output, session) {
 		}
 	}, bg="transparent", height=function() {
 		session$clientData$output_map_width * 9./16
+	})
+
+	output$mapvalues <- renderPlot({
+		values <- communesInput()
+		if (length(values) > 0) {
+			par(bg=NA, bty="n", xpd=NA, xaxs='i', xaxt='n', yaxs='i', yaxt='n', plt=c(0,1,0,1), oma=c(0,0,0,0))
+			plot(extent(mapCorners),col="transparent")
+			raster::text(values, labels=values$TEMP,
+				family=c("D-DIN Condensed"), halo=TRUE, hc="black", col="white", cex=2)
+		}
+	}, bg="transparent", height=function() {
+		session$clientData$output_mapvalues_width * 9./16
 	})
 }
 
