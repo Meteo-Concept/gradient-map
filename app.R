@@ -6,6 +6,9 @@ library(RColorBrewer)
 library(sysfonts)
 library(shiny)
 library(colourpicker)
+library(DBI)
+library(RSQLite)
+library(RMariaDB)
 
 source('threshold.R')
 
@@ -25,13 +28,9 @@ mapCorners <- cbind(rep(c(-7.3,-0.1),2),rep(c(46.6,49.7),each=2))
 mapCorners <- SpatialPoints(mapCorners, proj4string=CRS("+init=epsg:4326"))
 mapCorners <- spTransform(mapCorners, crs(contour))
 
-# for tests
-thresholds <- list(
-	list(color="white" , value=0),
-	list(color="green" , value=20),
-	list(color="yellow", value=50),
-	list(color="orange", value=70),
-	list(color="red"   , value=100)
+paletteConn <- dbConnect(
+	drv = RSQLite::SQLite(),
+	dbname = "palettes.sqlite"
 )
 
 mid <- trunc(length(communes)/2)
@@ -41,7 +40,7 @@ ui <- fluidPage(
 		sidebarPanel(
 			h1("Paramètres"),
 			h2("Couleurs"),
-			selectInput("palette", "Palettes prédéfinies", c("Température"="temp", "Précipitations"="rain", "Ensoleillement"="sun")),
+			selectInput("palette", "Palettes prédéfinies",  NULL),
 			wellPanel(
 				textInput("palette-name", "Nom"),
 				tags$div(id="thresholds_container",
@@ -77,6 +76,18 @@ ui <- fluidPage(
 
 
 server <- function(input, output, session) {
+	updateSelectInput(session, 'palette', choices={
+		palettes <- dbReadTable(paletteConn, "palettes")
+		groups <- unique(palettes$owner)
+		names(groups) <- groups
+		lapply(groups, function (o) {
+			relevant <- palettes[palettes$owner=='Système',]
+			p <- as.list(relevant$id);
+			names(p) <- relevant$name
+			return (p)
+		})
+	})
+
 	reactivePalette <- reactiveValues(
 		raw_thresholds=list(),
 		thresholds=list(),
@@ -85,9 +96,47 @@ server <- function(input, output, session) {
 		ordering=NULL
 	)
 
+
+	observe({
+		choice <- input$palette
+		req(choice)
+		isolate({
+			print(file=stderr(), "User has selected a palette")
+			sql <- "SELECT colour,value FROM thresholds WHERE palette_id = ?palette_id ORDER BY value ASC"
+			query <- sqlInterpolate(paletteConn, sql, palette_id=choice)
+			thresholds <- dbGetQuery(paletteConn, query)
+			#print(file=stderr(), thresholds)
+
+			last_id <- reactivePalette$last_id
+			nb <- nrow(thresholds)
+			raw_thresholds <- lapply(1:nb, function (i) {
+				newId <- i + last_id
+				newModule <- debounce(callModule(threshold, paste0("threshold_",newId), container=paste0("container_",newId)), 500)
+
+				observeEvent(newModule()$removal, {
+					reactivePalette$raw_thresholds <- reactivePalette$raw_thresholds[sapply(reactivePalette$raw_thresholds, function (th) th$id != newId)]
+					reactivePalette$ids <- reactivePalette$ids[sapply(reactivePalette$ids, function (id) id != newId)]
+				})
+
+				list(
+					module=newModule,
+					initialColour=thresholds[i, 'colour'],
+					initialValue=thresholds[i, 'value'],
+					id=newId
+				)
+			})
+
+			reactivePalette$raw_thresholds <- raw_thresholds
+			reactivePalette$last_id <- last_id + nb
+			reactivePalette$ids <- as.list(last_id + 1:nb)
+			reactivePalette$ordering <- 1:nb
+		})
+	})
+
+
 	observeEvent(input$new_threshold, {
 		newId <- reactivePalette$last_id + 1
-		newModule <- debounce(callModule(threshold, paste0("threshold_",newId), container=paste0("container_",newId)), 500)
+		newModule <- debounce(callModule(threshold, paste0("threshold_",newId), container=paste0("container_",newId), colour=input$new_colour, value=input$new_value), 500)
 		reactivePalette$raw_thresholds <- c(reactivePalette$raw_thresholds,
 			list(
 				list(
@@ -118,24 +167,24 @@ server <- function(input, output, session) {
 				values <- sapply(reactivePalette$raw_thresholds, function (th) {
 					module <- th$module()
 					if (is.null(module$value))
-						th$initialValue
+						return(th$initialValue)
 					else
-						module$value
+						return(module$value)
 				})
 				ordering <- order(values)
 			}
 			reactivePalette$raw_thresholds <- reactivePalette$raw_thresholds[ordering]
+			#print(file=stderr(), reactivePalette$raw_thresholds)
 			lapply(reactivePalette$raw_thresholds, function (th) {
 				module <- th$module()
 				print(file=stderr(), module)
-				if (is.null(module$colour) || is.null(module$value)) {
+				if (is.null(module$value) || is.null(module$colour))
 					return(list(colour=th$initialColour, value=th$initialValue, id=th$id))
-				} else {
+				else
 					return(c(module, id=th$id))
-				}
 			})
 		})
-		print(file=stderr(), the_thresholds)
+		#print(file=stderr(), the_thresholds)
 		return(the_thresholds)
 	})
 
@@ -143,8 +192,8 @@ server <- function(input, output, session) {
 		print(file=stderr(), "A module has changed")
 		the_thresholds <- lapply(reactivePalette$raw_thresholds, function (th) th$module())
 		values <- sapply(the_thresholds, function (l) l$value)
-		print(file=stderr(), "Values to check are: ")
-		print(file=stderr(), values)
+		#print(file=stderr(), "Values to check are: ")
+		#print(file=stderr(), values)
 		if (is.null(values) || length(values) < 2 || any(sapply(values,is.null))) {
 			print(file=stderr(), "Palette is not usable yet")
 			return(list(domain=NULL, range=NULL))
@@ -169,14 +218,14 @@ server <- function(input, output, session) {
 			domain=seq(min(values), max(values), 0.1),
 			range=unlist(sapply(1:(length(colors)-1), function (i) colorRampPalette(c(colors[i], colors[i+1]))(steps[i])))
 		)
-	}), 2000)
+	}), 1000)
 
 
 	communesInput <- debounce(reactive({
 		for (i in 1:length(communes))
 			communes[i,'TEMP'] <- input[[paste0("city-",i)]]
 		communes[!is.na(communes$TEMP),]
-	}), 2000)
+	}), 1000)
 
 	output$thresholds <- renderUI({
 		print(file=stderr(), "Refreshing the UI")
@@ -226,5 +275,5 @@ server <- function(input, output, session) {
 }
 
 
-runApp(shinyApp(ui = ui, server = server), launch.browser=F)
+shinyApp(ui = ui, server = server)
 
