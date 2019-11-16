@@ -5,6 +5,8 @@ library(raster)
 library(RColorBrewer)
 library(sysfonts)
 library(shiny)
+library(shinyjs)
+library(shinyalert)
 library(colourpicker)
 library(DBI)
 library(RSQLite)
@@ -35,6 +37,8 @@ paletteConn <- dbConnect(
 
 mid <- trunc(length(communes)/2)
 ui <- fluidPage(
+	useShinyjs(),
+	useShinyalert(),
 	titlePanel("Carte"),
 	sidebarLayout(
 		sidebarPanel(
@@ -42,7 +46,9 @@ ui <- fluidPage(
 			h2("Couleurs"),
 			selectInput("palette", "Palettes prédéfinies",  NULL),
 			wellPanel(
-				textInput("palette-name", "Nom"),
+				textInput("palette_name", "Nom"),
+				numericInput("palette_increment", "Incrément", value=0.1),
+				p(textOutput("palette_size", inline=T), " couleurs dans le dégradé"),
 				tags$div(id="thresholds_container",
 					uiOutput("thresholds")
 				)
@@ -74,19 +80,22 @@ ui <- fluidPage(
 	)
 )
 
-
-server <- function(input, output, session) {
+refreshPaletteSelector <- function(session) {
 	updateSelectInput(session, 'palette', choices={
 		palettes <- dbReadTable(paletteConn, "palettes")
 		groups <- unique(palettes$owner)
 		names(groups) <- groups
 		lapply(groups, function (o) {
-			relevant <- palettes[palettes$owner=='Système',]
-			p <- as.list(relevant$id);
+			relevant <- palettes[palettes$owner==o,]
+			p <- relevant$id
 			names(p) <- relevant$name
-			return (p)
+			p
 		})
 	})
+}
+
+server <- function(input, output, session) {
+	refreshPaletteSelector(session)
 
 	reactivePalette <- reactiveValues(
 		raw_thresholds=list(),
@@ -96,16 +105,75 @@ server <- function(input, output, session) {
 		ordering=NULL
 	)
 
+	observeEvent(input$save_palette, {
+		name <- input$palette_name
+		increment <- input$palette_increment
+		the_thresholds <- reactivePalette$thresholds()
+		if (name == "") {
+			shinyalert("Erreur", "Il faut donner un nom à cette palette pour l'enregistrer", type="error")
+			req(FALSE)
+		}
+		sql <- "SELECT COUNT(*) AS count FROM palettes WHERE name = ?name"
+		query <- sqlInterpolate(paletteConn, sql, name=name)
+		alreadyExisting <- dbGetQuery(paletteConn, query)
+		if (alreadyExisting$count > 0) {
+			shinyalert("Erreur", "Une palette existe déjà avec ce nom. Si vous souhaitez la remplacer, vous devez la supprimer auparavant.", type="error")
+			req(FALSE)
+		}
+
+		sql <- "INSERT INTO palettes (name,owner,mutable,increment) VALUES (?name, ?owner, ?mutable, ?increment)"
+		query <- sqlInterpolate(paletteConn, sql, name=name, owner='Utilisateur', mutable=T, increment=increment)
+		insertion <- dbExecute(paletteConn, query)
+		lastInsertId <- dbGetQuery(paletteConn, "SELECT last_insert_rowid() AS id")
+		sql <- "INSERT INTO thresholds (palette_id, colour, value) VALUES (?palette_id, ?colour, ?value)"
+		lapply(the_thresholds, function (th) {
+			query <- sqlInterpolate(paletteConn, sql, palette_id=lastInsertId$id, colour=th$colour, value=th$value)
+			dbExecute(paletteConn, query)
+		})
+
+		print(file=stderr(), "saved")
+		refreshPaletteSelector(session)
+	})
+
+	observeEvent(input$delete_palette, {
+		id <- input$palette
+		sql <- "SELECT name,owner,mutable FROM palettes WHERE id = ?id"
+		query <- sqlInterpolate(paletteConn, sql, id=id)
+		paletteToDelete <- dbGetQuery(paletteConn, query)
+		if (nrow(paletteToDelete) != 1) {
+			shinyalert("Erreur", "La palette n'existe déjà plus.", type="error")
+			req(FALSE)
+		}
+		if (paletteToDelete$owner == "Système" || paletteToDelete$mutable == 0) {
+			shinyalert("Erreur", "Cette palette ne peut pas être supprimée", type="error")
+			req(FALSE)
+		}
+		sql <- "DELETE FROM thresholds WHERE palette_id = ?id"
+		query <- sqlInterpolate(paletteConn, sql, id=id)
+		dbExecute(paletteConn, query)
+		sql <- "DELETE FROM palettes WHERE id = ?id"
+		query <- sqlInterpolate(paletteConn, sql, id=id)
+		dbExecute(paletteConn, query)
+
+		print(file=stderr(), "deleted")
+		refreshPaletteSelector(session)
+	})
 
 	observe({
 		choice <- input$palette
 		req(choice)
 		isolate({
 			print(file=stderr(), "User has selected a palette")
+			sql <- "SELECT name,owner,increment FROM palettes WHERE id = ?id"
+			query <- sqlInterpolate(paletteConn, sql, id=choice)
+			selectedPalette <- dbGetQuery(paletteConn, query)
 			sql <- "SELECT colour,value FROM thresholds WHERE palette_id = ?palette_id ORDER BY value ASC"
 			query <- sqlInterpolate(paletteConn, sql, palette_id=choice)
+			updateNumericInput(session, "palette_increment", value=selectedPalette$increment)
 			thresholds <- dbGetQuery(paletteConn, query)
 			#print(file=stderr(), thresholds)
+
+			updateTextInput(session, "palette_name", value=selectedPalette[1,'name'])
 
 			last_id <- reactivePalette$last_id
 			nb <- nrow(thresholds)
@@ -130,13 +198,14 @@ server <- function(input, output, session) {
 			reactivePalette$last_id <- last_id + nb
 			reactivePalette$ids <- as.list(last_id + 1:nb)
 			reactivePalette$ordering <- 1:nb
+			reactivePalette$modified <- 0
 		})
 	})
 
 
 	observeEvent(input$new_threshold, {
 		newId <- reactivePalette$last_id + 1
-		newModule <- debounce(callModule(threshold, paste0("threshold_",newId), container=paste0("container_",newId), colour=input$new_colour, value=input$new_value), 500)
+		newModule <- debounce(callModule(threshold, paste0("threshold_",newId), container=paste0("container_",newId)), 500)
 		reactivePalette$raw_thresholds <- c(reactivePalette$raw_thresholds,
 			list(
 				list(
@@ -160,6 +229,7 @@ server <- function(input, output, session) {
 		# take a dependency on the list of ids but not on all individual modules
 		ids <- reactivePalette$ids
 		ordering <- reactivePalette$ordering
+		reactivePalette$modified <- 1
 		print(file=stderr(), "New thresholds")
 		the_thresholds <- isolate({
 			if (length(ordering) != length(reactivePalette$raw_thresholds)) {
@@ -177,7 +247,7 @@ server <- function(input, output, session) {
 			#print(file=stderr(), reactivePalette$raw_thresholds)
 			lapply(reactivePalette$raw_thresholds, function (th) {
 				module <- th$module()
-				print(file=stderr(), module)
+				#print(file=stderr(), module)
 				if (is.null(module$value) || is.null(module$colour))
 					return(list(colour=th$initialColour, value=th$initialValue, id=th$id))
 				else
@@ -191,6 +261,10 @@ server <- function(input, output, session) {
 	paletteInput <- debounce(reactive({
 		print(file=stderr(), "A module has changed")
 		the_thresholds <- lapply(reactivePalette$raw_thresholds, function (th) th$module())
+		increment <- input$palette_increment
+		validate(
+			need(!is.null(increment) && !is.na(increment) && increment > 0, "Incrément invalide (essayez une valeur de 1 ou 0,1)")
+		)
 		values <- sapply(the_thresholds, function (l) l$value)
 		#print(file=stderr(), "Values to check are: ")
 		#print(file=stderr(), values)
@@ -208,14 +282,15 @@ server <- function(input, output, session) {
 			# ... and bail out
 			return(list(domain=NULL, range=NULL))
 		}
+		reactivePalette$modified <- 1
 		colors <- sapply(the_thresholds, function (l) l$colour)
-		steps <- (values[-1] - values[-length(values)]) * 10
+		steps <- (values[-1] - values[-length(values)]) / increment
 		#print(file=stderr(), "Colors and steps are: ")
 		#print(file=stderr(), colors)
 		#print(file=stderr(), steps)
 
 		list(
-			domain=seq(min(values), max(values), 0.1),
+			domain=seq(min(values), max(values), increment),
 			range=unlist(sapply(1:(length(colors)-1), function (i) colorRampPalette(c(colors[i], colors[i+1]))(steps[i])))
 		)
 	}), 1000)
@@ -226,6 +301,11 @@ server <- function(input, output, session) {
 			communes[i,'TEMP'] <- input[[paste0("city-",i)]]
 		communes[!is.na(communes$TEMP),]
 	}), 1000)
+
+	output$palette_size <- renderText({
+		palette <- paletteInput()
+		length(palette$domain)
+	})
 
 	output$thresholds <- renderUI({
 		print(file=stderr(), "Refreshing the UI")
@@ -275,5 +355,5 @@ server <- function(input, output, session) {
 }
 
 
-shinyApp(ui = ui, server = server)
+runApp(shinyApp(ui = ui, server = server), launch.browser=F)
 
