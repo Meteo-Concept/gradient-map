@@ -26,9 +26,9 @@ col <- list(
 	)
 )
 
-contour <- readOGR(dsn="./brittany.json")
+contour <- readOGR(dsn="./five_deps.json")
 contour <- spTransform(contour, CRS("+init=epsg:3857"))
-communes <- readOGR(dsn="./selection.json")
+communes <- readOGR(dsn="./selection_five_deps.json")
 communes <- spTransform(communes, CRS("+init=epsg:3857"))
 communes$TEMP <- 0
 
@@ -38,7 +38,7 @@ coordinates(grd) <- ~ x+y
 crs(grd) <- crs(contour)
 gridded(grd) <- TRUE
 
-mapCorners <- cbind(rep(c(-7.3,-0.1),2),rep(c(46.6,49.7),each=2))
+mapCorners <- cbind(rep(c(-6.875,0.6616),2),rep(c(46.1056,48.9676),each=2))
 mapCorners <- SpatialPoints(mapCorners, proj4string=CRS("+init=epsg:4326"))
 mapCorners <- spTransform(mapCorners, crs(contour))
 
