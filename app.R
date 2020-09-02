@@ -7,18 +7,41 @@ library(sysfonts)
 library(shiny)
 library(shinyjs)
 library(shinyalert)
-library(colourpicker)
-library(DBI)
-library(RSQLite)
-library(RMariaDB)
+library(grid)
+library(magick)
+library(httr)
+library(data.table)
 
-source('threshold.R')
+breaks <- list(
+	temp=seq(-15,40,0.1)
+)
+col <- list(
+	temp=c(
+		colorRampPalette(c("#D202B4","#660066"))(50),
+		colorRampPalette(c("#660066","#0F2267"))(50),
+		colorRampPalette(c("#0F2267","#0069BA"))(50),
+		colorRampPalette(c("#0069BA","#3399FF"))(50),
+		colorRampPalette(c("#3399FF","#11B34F"))(50),
+		colorRampPalette(c("#11B34F","#BDCC40"))(50),
+		colorRampPalette(c("#BDCC40","#F7C72A"))(30),
+		colorRampPalette(c("#F7C72A","#FF6100"))(40),
+		colorRampPalette(c("#FF6100","#FE0F03"))(40),
+		colorRampPalette(c("#FE0F03","#9B0002"))(40),
+		colorRampPalette(c("#9B0002","#480000"))(50),
+		colorRampPalette(c("#480000","#000000"))(50)
+	)
+)
+
+apikey <- Sys.getenv("METEOCONCEPT_API_KEY")
 
 contour <- readOGR(dsn="./brittany.json")
 contour <- spTransform(contour, CRS("+init=epsg:3857"))
 communes <- readOGR(dsn="./selection.json")
-communes <- spTransform(communes, CRS("+init=epsg:3857"))
+communes <- spTransform(communes, crs(contour))
 communes$TEMP <- 0
+sea <- readOGR(dsn="./sea.json")
+sea <- spTransform(sea, crs(contour))
+sea$TEMP <- 0
 
 ext <- extent(contour)
 grd <- expand.grid(x=seq(from=xmin(ext)-5000, to=xmax(ext)+5000, by=500), y=seq(from=ymin(ext)-5000, to=ymax(ext)+5000, by=500))
@@ -26,7 +49,7 @@ coordinates(grd) <- ~ x+y
 crs(grd) <- crs(contour)
 gridded(grd) <- TRUE
 
-mapCorners <- cbind(rep(c(-7.3,-0.1),2),rep(c(46.6,49.7),each=2))
+mapCorners <- cbind(rep(c(-8.00, -0.20),2),rep(c(46.65, 49.58),each=2))
 mapCorners <- SpatialPoints(mapCorners, proj4string=CRS("+init=epsg:4326"))
 mapCorners <- spTransform(mapCorners, crs(contour))
 
@@ -36,6 +59,7 @@ paletteConn <- dbConnect(
 )
 
 mid <- trunc(length(communes)/2)
+midsea <- trunc(length(sea)/2)
 ui <- fluidPage(
 	useShinyjs(),
 	useShinyalert(),
@@ -43,56 +67,99 @@ ui <- fluidPage(
 	sidebarLayout(
 		sidebarPanel(
 			h1("Paramètres"),
-			h2("Couleurs"),
-			selectInput("palette", "Palettes prédéfinies",  NULL),
-			wellPanel(
-				textInput("palette_name", "Nom"),
-				numericInput("palette_increment", "Incrément", value=0.1),
-				p(textOutput("palette_size", inline=T), " couleurs dans le dégradé"),
-				tags$div(id="thresholds_container",
-					uiOutput("thresholds")
-				)
-			),
-			fluidRow(
-				column(4, colourInput("new_colour",NULL,value="grey")),
-				column(4, numericInput("new_value",NULL,value=0)),
-				column(4, actionButton("new_threshold","Ajouter",icon=icon("plus")))
-			),
-			actionButton("save_palette", "Sauver", icon=icon("save")),
-			actionButton("delete_palette", "Supprimer", icon=icon("trash-alt")),
-			h2("Villes"),
-			p("Entrez une valeur vide pour ne pas tenir compte de la ville. Donnez au moins une valeur pour générer la carte."),
-			fluidRow(
-				column(6,
-					lapply(1:mid, function(n) numericInput(inputId=paste0("city-",n),label=communes[n,]$NOM_COM, value=NA))
+			tags$div(id="accordion",
+			    tags$div(class="panel panel-primary",
+			         tags$div(class="panel-heading", id="panel-heading-1",
+			            tags$h2(role="button", `data-toggle`="collapse", `data-target`="#collapse-1", "Date et heure")
+			         ),
+			        tags$div(id="collapse-1", class="panel-body collapse", `data-parent`="#accordion",
+			        p("Pré-remplissage"),
+			        fluidRow(
+			           column(12,
+			              dateInput(inputId="date",label="Date", value=Sys.Date() + 1, language="fr")
+			           ),
+			        ),
+			        fluidRow(
+			           column(12,
+			              selectInput(inputId="period",label="Période", choices=c("Nuit"="0", "Matin"="1", "Après-midi"="2", "Soirée"="3"))
+			           )
+			        ),
+			        fluidRow(
+			          column(12,
+			             actionButton(inputId="loadData",label="Charger les données depuis le modèle")
+			          )
+			        )
+			     )
+			  ),
+				tags$div(class="panel panel-primary",
+					tags$div(class="panel-heading", id="panel-heading-2",
+						tags$h2(role="button", `data-toggle`="collapse", `data-target`="#collapse-2", "Titres")
 					),
-				column(6,
-					lapply((mid+1):length(communes), function(n) numericInput(inputId=paste0("city-",n),label=communes[n,]$NOM_COM, value=NA))
+					tags$div(id="collapse-2", class="panel-body collapse", `data-parent`="#accordion",
+						p("Décoration"),
+						fluidRow(
+							column(12,
+								textInput(inputId="title",label="Titre", value=stringr::str_to_upper(strftime(Sys.Date() + 1, "%A %d %B"), locale="fr"))
+							),
+						),
+						fluidRow(
+							column(12,
+								textInput(inputId="subtitle",label="Sous-titre", value="MATIN")
+							)
+						),
+						fluidRow(
+							column(12,
+								selectInput(inputId="tendency",label="Tendance", choices=c("En hausse"="./rising.png", "Stable"="./stable.png", "En baisse"="./lowering.png"))
+							)
+						)
+					)
+				),
+				tags$div(class="panel panel-primary",
+					tags$div(class="panel-heading", id="panel-heading-3",
+						tags$h2(role="button", `data-toggle`="collapse", `data-target`="#collapse-3", "Villes")
+					),
+					tags$div(id="collapse-3", class="panel-body collapse", `data-parent`="#accordion",
+						p("Entrez une valeur vide pour ne pas tenir compte de la ville. Donnez au moins une valeur pour générer la carte."),
+						fluidRow(
+							column(6,
+									lapply(1:mid, function(n) numericInput(inputId=paste0("city-",n),label=communes[n,]$NOM_COM, value=NA))
+							),
+							column(6,
+									lapply((mid+1):length(communes), function(n) numericInput(inputId=paste0("city-",n),label=communes[n,]$NOM_COM, value=NA))
+							)
+						)
+					)
+				),
+				tags$div(class="panel panel-primary",
+					tags$div(class="panel-heading", id="panel-heading-4",
+						tags$h2(role="button", `data-toggle`="collapse", `data-target`="#collapse-4", "Mer")
+					),
+					tags$div(id="collapse-4", class="panel-body collapse", `data-parent`="#accordion",
+						fluidRow(
+							column(6,
+									lapply(1:midsea, function(n) numericInput(inputId=paste0("sea-",n),label=sea[n,]$NOM, value=15))
+							),
+							column(6,
+									lapply((midsea+1):length(sea), function(n) numericInput(inputId=paste0("sea-",n),label=sea[n,]$NOM, value=15))
+							)
+						)
+					)
 				)
 			)
 		),
 		mainPanel(
+			h1("Carte de température"),
+			p("L'ancien outil est disponible ", a("ici", href="/gradient_map_v1"), "."),
 			fluidRow(
-				column(12, plotOutput(outputId="map", height="auto")), #, height="600px"
-				column(12, plotOutput(outputId="mapvalues", height="auto")) #, height="600px"
+				 column(12, h2("Aperçu")),
+				 column(12, plotOutput(outputId="map", height="auto")) #, height="600px"
+			),
+			fluidRow(
+				column(12, downloadButton(outputId="download", label="Télécharger l'image"))
 			)
 		)
 	)
 )
-
-refreshPaletteSelector <- function(session) {
-	updateSelectInput(session, 'palette', choices={
-		palettes <- dbReadTable(paletteConn, "palettes")
-		groups <- unique(palettes$owner)
-		names(groups) <- groups
-		lapply(groups, function (o) {
-			relevant <- palettes[palettes$owner==o,]
-			p <- relevant$id
-			names(p) <- relevant$name
-			p
-		})
-	})
-}
 
 server <- function(input, output, session) {
 	refreshPaletteSelector(session)
@@ -324,34 +391,93 @@ server <- function(input, output, session) {
 		}
 	})
 
-	output$map <- renderPlot({
-		values <- communesInput()
-		palette <- paletteInput()
-		print(file=stderr(), paste("Length of palette:", length(palette$domain)))
+	seaInput <- debounce(reactive({
+		for (i in 1:length(sea))
+			sea[i,'TEMP'] <- input[[paste0("sea-",i)]]
+		sea[!is.na(sea$TEMP),]
+	}), 2000)
 
-		if (length(values) > 0 && length(palette$domain) > 1) {
-			pred <- idw(TEMP~1, locations=values, newdata=grd)
-			par(bg=NA, bty="n", xpd=NA, xaxs='i', xaxt='n', yaxs='i', yaxt='n', plt=c(0,1,0,1), oma=c(0,0,0,0))
+	predInput <- reactive({
+		values <- communesInput()
+		if (length(values) > 0) {
+			return(idw(TEMP~1, locations=values, newdata=grd))
+		}
+	})
+
+	observeEvent(input$loadData, {
+	  req(input$date)
+	  req(input$period)
+
+	  day <- as.character(as.numeric(input$date - Sys.Date(), units="days"))
+	  period <- input$period
+
+	  queryCities <- paste0("https://api.meteo-concept.fr/api/forecast/daily/",day,"/period/",period,"/map")
+	  result <- GET(queryCities, query=list(listCity=paste(communes$INSEE_COM, collapse=","), token=apikey))
+		if (result$status_code == 200) {
+			parsed <- content(result, "parsed")
+			forecast <- rbindlist(parsed$forecast, use.names=T)
+			updateTextInput(session, "title", value=stringr::str_to_upper(strftime(input$date, "%A %d %B"), locale="fr"))
+			updateTextInput(session, "subtitle", value=c("NUIT","MATIN","APRÈS-MIDI","SOIRÉE")[as.numeric(period) + 1])
+			for (i in 1:length(communes)) {
+				newValue <- forecast[insee == as.character(communes[i,]$INSEE_COM),temp2m]
+				updateNumericInput(session, paste0("city-",i), value=newValue)
+			}
+		}
+	})
+
+	makePlot <- function() {
+		values <- communesInput()
+		pred <- predInput()
+		seaValues <- seaInput()
+		title <- input$title
+		subtitle <- input$subtitle
+		tendency <- input$tendency
+		if (length(values) > 0) {
+			par(bg=NA, bty="n", xpd=NA, xaxs='i', xaxt='n', yaxs='i', yaxt='n',
+				plt=c(0,1,0,1), oma=c(0,0,0,0))
+
 			r <- mask(raster(pred), contour, updatevalue=NA)
 			plot(extent(mapCorners),col="transparent")
-			plot(r, col=palette$range, breaks=palette$domain,add=T, axis=F, legend=F)
-		}
-	}, bg="transparent", height=function() {
-		session$clientData$output_map_width * 9./16
-	})
 
-	output$mapvalues <- renderPlot({
-		values <- communesInput()
-
-		if (length(values) > 0) {
-			par(bg=NA, bty="n", xpd=NA, xaxs='i', xaxt='n', yaxs='i', yaxt='n', plt=c(0,1,0,1), oma=c(0,0,0,0))
-			plot(extent(mapCorners),col="transparent")
+			grid.raster(image_read('./sea_big.png'))
+			plot(r, col=col[['temp']], breaks=breaks[['temp']],add=T, axis=F, legend=F)
+			grid.raster(image_read('./meteo_bretagne_holes.png'))
 			raster::text(values, labels=values$TEMP,
-				family=c("D-DIN Condensed"), halo=TRUE, hc="black", col="white", cex=2)
+				family=c("D-DIN Condensed"), font=2, halo=TRUE, hc="black", hw=0.15, col="white", cex=2.5)
+
+			raster::text(seaValues, labels=seaValues$TEMP,
+				family=c("D-DIN Condensed"), halo=TRUE, col="#8AAFCF", cex=2)
+
+			grid.text(title, x=unit(0.10, "npc"), y=unit(0.85, "npc"),
+							gp=gpar(fontfamily="D-DIN Condensed", fontface="bold", cex=4, col="white"),
+							just=c("left","bottom"))
+			grid.text(subtitle, x=unit(0.10, "npc"), y=unit(0.82, "npc"),
+							gp=gpar(fontfamily="Liberation", cex=3, col="white"),
+							just=c("left","top"))
+
+			grid.raster(image_read(tendency), x=unit(0.95, "npc"), y=unit(0.5, "npc"), width=unit(0.040, "npc"))
+
+			rasterImage(image_read("./wave.png"),
+				xleft=(coordinates(sea)[,1] - xinch(.2)),
+				xright=(coordinates(sea)[,1] + xinch(.2)),
+				ytop=(coordinates(sea)[,2] - yinch(.1)),
+				ybottom=(coordinates(sea)[,2] - yinch(.4))
+			)
 		}
-	}, bg="transparent", height=function() {
-		session$clientData$output_mapvalues_width * 9./16
-	})
+	}
+
+	output$map <- renderPlot({
+		makePlot()
+	}, height = function() { session$clientData$output_map_width * 9./16 })
+
+	output$download <- downloadHandler(
+		filename = function() {
+			paste(input$title, ".png", sep="")
+		},
+		content = function(file) {
+			plotPNG(makePlot, filename=file, width=1920, height=1080, res=72 * 1920/session$clientData$output_map_width)
+		}
+	)
 }
 
 
